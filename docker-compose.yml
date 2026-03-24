@@ -1,0 +1,166 @@
+services:
+
+  # =============================================================
+  # CASSANDRA - Database backend for TheHive
+  # =============================================================
+  cassandra:
+    container_name: cassandra
+    image: 'cassandra:4'
+    restart: unless-stopped
+    ports:
+      - "9042:9042"
+    environment:
+      - CASSANDRA_CLUSTER_NAME=TheHive
+      - MAX_HEAP_SIZE=1024M
+      - HEAP_NEWSIZE=256M
+    volumes:
+      - cassandradata:/var/lib/cassandra
+    networks:
+      - soc-net
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # =============================================================
+  # ELASTICSEARCH - Index backend for TheHive + Cortex
+  # =============================================================
+  elasticsearch:
+    container_name: elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.24
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - cluster.name=soc-cluster
+      - http.host=0.0.0.0
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - script.allowed_types=inline,stored
+      - thread_pool.search.queue_size=100000
+      - thread_pool.write.queue_size=10000
+    volumes:
+      - elasticdata:/usr/share/elasticsearch/data
+    networks:
+      - soc-net
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # =============================================================
+  # MINIO - S3-compatible storage for TheHive file attachments
+  # =============================================================
+  minio:
+    container_name: minio
+    image: quay.io/minio/minio
+    restart: unless-stopped
+    command: ["minio", "server", "/data", "--console-address", ":9090", "--address", ":9002"]
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9002:9002"     # S3 API
+      - "9090:9090"     # MinIO Console
+    volumes:
+      - miniodata:/data
+    networks:
+      - soc-net
+    healthcheck:
+      test: ["CMD", "curl" , "-f" , "http://localhost:9002/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # =============================================================
+  # CORTEX - Observable Analysis Engine
+  # =============================================================
+  cortex:
+    container_name: cortex
+    image: thehiveproject/cortex:3.1.8
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "9001:9001"
+    environment:
+      - job_directory=/tmp/cortex-jobs
+    volumes:
+      - ./cortex/application.conf:/etc/cortex/application.conf
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/cortex-jobs:/tmp/cortex-jobs
+    networks:
+      - soc-net
+
+  # =============================================================
+  # THEHIVE 5 - Security Incident Response Platform
+  # =============================================================
+  thehive:
+    container_name: thehive
+    image: strangebee/thehive:5.4
+    restart: unless-stopped
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      cortex:
+        condition: service_started
+    mem_limit: 1500m
+    ports:
+      - "9000:9000"
+    environment:
+      - JVM_OPTS=-Xms1024M -Xmx1024M
+    command:
+      - --secret
+      - "${THEHIVE_SECRET}"
+      - "--cql-hostnames"
+      - "cassandra"
+      - "--index-backend"
+      - "elasticsearch"
+      - "--es-hostnames"
+      - "elasticsearch"
+      - "--s3-endpoint"
+      - "http://minio:9002"
+      - "--s3-access-key"
+      - "${MINIO_ROOT_USER}"
+      - "--s3-secret-key"
+      - "${MINIO_ROOT_PASSWORD}"
+      - "--s3-use-path-access-style"
+      - "--cortex-hostnames"
+      - "cortex"
+      - "--cortex-port"
+      - "9001"
+    volumes:
+      - thehivedata:/opt/thehive/data
+    networks:
+      - soc-net
+
+# =============================================================
+# VOLUMES
+# =============================================================
+volumes:
+  cassandradata:
+  elasticdata:
+  miniodata:
+  thehivedata:
+
+# =============================================================
+# NETWORKS
+# =============================================================
+networks:
+  soc-net:
+    driver: bridge
